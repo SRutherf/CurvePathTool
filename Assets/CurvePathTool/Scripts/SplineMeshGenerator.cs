@@ -1,6 +1,10 @@
 using System.Collections.Generic;
 using UnityEngine;
 
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
+
 namespace SplineMeshTool
 {
     [ExecuteAlways]
@@ -20,11 +24,7 @@ namespace SplineMeshTool
 
         [Header("Profile")]
         public CrossSectionProfile profile;
-
-        [Tooltip("If true, uses profile.closed. If false, overrides with 'forceClosed'.")]
         public bool useProfileClosedFlag = true;
-
-        [Tooltip("Only used if useProfileClosedFlag is false.")]
         public bool forceClosed = false;
 
         [Header("Resolution")]
@@ -34,15 +34,10 @@ namespace SplineMeshTool
 
         [Header("Orientation")]
         public OrientationMode orientationMode = OrientationMode.KeepLevel;
-
-        [Tooltip("For KeepLevel mode: up vector is world-up, transformed into this object's local space.")]
         public bool keepLevelUseWorldUp = true;
 
         [Header("Scale (Profile Units -> World Meters)")]
-        [Tooltip("Scales the profile's X (right) values.")]
         public float baseWidth = 1f;
-
-        [Tooltip("Scales the profile's Y (up) values.")]
         public float baseHeight = 1f;
 
         [Header("Taper Curves (0..1 along path)")]
@@ -50,28 +45,31 @@ namespace SplineMeshTool
         public AnimationCurve heightOverPath = AnimationCurve.Linear(0f, 1f, 1f, 1f);
 
         [Header("UVs")]
-        [Tooltip("Multiply profile U (0..1 around perimeter) by this.")]
         public float uScale = 1f;
-
-        [Tooltip("V = distanceMeters * vMetersToUV (then multiplied by profile.vScale).")]
         public float vMetersToUV = 0.25f;
 
         [Header("Collider (optional)")]
         public bool generateCollider = false;
-
-        [Tooltip("If > 0, collider uses its own metersPerRing (coarser is faster). If <= 0, collider uses metersPerRing.")]
         public float colliderMetersPerRing = -1f;
 
         [Header("Rebuild")]
         public bool autoRebuild = true;
-
-        [Tooltip("If true, regenerates when selected in editor via OnValidate/Update. Disable if scene gets heavy.")]
         public bool rebuildInEditMode = true;
+
+        [Header("Bake")]
+        public bool freezeWhenBaked = true;
+        public string bakedFolder = "Assets/SplineMeshTool/BakedMeshes";
+
+        [SerializeField, HideInInspector] private Mesh bakedMeshAsset;
+        [SerializeField, HideInInspector] private Mesh bakedColliderMeshAsset;
+        [SerializeField, HideInInspector] private bool isBaked;
+
+        public bool IsBaked => isBaked;
+        public Mesh BakedMeshAsset => bakedMeshAsset;
 
         private MeshFilter _mf;
         private MeshCollider _mc;
 
-        // We keep preview meshes alive so we can destroy them and avoid leaking meshes in Edit Mode.
         private Mesh _previewMesh;
         private Mesh _previewColliderMesh;
 
@@ -88,19 +86,12 @@ namespace SplineMeshTool
             _mc = GetComponent<MeshCollider>();
             if (path == null) path = GetComponent<SplinePath>();
 
-            if (autoRebuild)
+            if (autoRebuild && !(freezeWhenBaked && isBaked))
                 RebuildPreview();
         }
 
-        private void OnDisable()
-        {
-            CleanupPreviewMeshes();
-        }
-
-        private void OnDestroy()
-        {
-            CleanupPreviewMeshes();
-        }
+        private void OnDisable() => CleanupPreviewMeshes();
+        private void OnDestroy() => CleanupPreviewMeshes();
 
         private void OnValidate()
         {
@@ -114,6 +105,9 @@ namespace SplineMeshTool
             uScale = Mathf.Max(0.0001f, uScale);
             vMetersToUV = Mathf.Max(0.0001f, vMetersToUV);
 
+            if (string.IsNullOrWhiteSpace(bakedFolder))
+                bakedFolder = "Assets/SplineMeshTool/BakedMeshes";
+
             if (path == null) path = GetComponent<SplinePath>();
             if (_mf == null) _mf = GetComponent<MeshFilter>();
             if (_mc == null) _mc = GetComponent<MeshCollider>();
@@ -121,121 +115,38 @@ namespace SplineMeshTool
 #if UNITY_EDITOR
             if (!Application.isPlaying && rebuildInEditMode && autoRebuild)
             {
-                // Avoid rebuilding during import/compile edge cases where references are null.
+                if (freezeWhenBaked && isBaked) return;
                 if (path != null && profile != null)
                     RebuildPreview();
             }
 #endif
         }
 
-#if UNITY_EDITOR
-        private void Update()
-        {
-            // Optional safety: if someone changes transform while not calling OnValidate, allow manual rebuild instead.
-            // Keeping Update empty avoids constant rebuilds.
-        }
-#endif
-
         [ContextMenu("Rebuild Preview")]
         public void RebuildPreview()
         {
+            if (freezeWhenBaked && isBaked) return;
+
             if (_mf == null) _mf = GetComponent<MeshFilter>();
             if (_mc == null) _mc = GetComponent<MeshCollider>();
             if (path == null) path = GetComponent<SplinePath>();
+            if (path == null || profile == null) return;
 
-            if (path == null || profile == null)
-                return;
+            // ----- Render mesh
+            var raw = path.SampleByDistance(metersPerRing, subdivisionsPerSegment, maxRings);
+            if (raw == null || raw.Count < 2) return;
 
-            // 1) Sample path (path-local), then convert to this object's local space
-            List<SplinePath.Sample> raw = path.SampleByDistance(metersPerRing, subdivisionsPerSegment, maxRings);
-            if (raw == null || raw.Count < 2)
-                return;
+            var frameRes = SplineFrameBuilder.BuildFrames(
+                path,
+                transform,
+                raw,
+                (SplineFrameBuilder.OrientationMode)orientationMode,
+                keepLevelUseWorldUp,
+                EvaluateRollDegreesApprox,
+                EvaluateWidthScaleApprox,
+                EvaluateHeightScaleApprox
+            );
 
-            // 2) Build frame samples (this object's local space)
-            var frames = new List<SplineExtruder.FrameSample>(raw.Count);
-
-            // World-up expressed in THIS object's local space (used for KeepLevel)
-            Vector3 upLocalRef = keepLevelUseWorldUp
-                ? transform.InverseTransformDirection(Vector3.up).normalized
-                : Vector3.up;
-
-            // Per-ring width/height multipliers based on spline point scales (optional)
-            float[] widthMul = new float[raw.Count];
-            float[] heightMul = new float[raw.Count];
-
-            for (int i = 0; i < raw.Count; i++)
-            {
-                var s = raw[i];
-
-                // Convert sample pos/tangent from path-local -> world -> this-local
-                Vector3 posWorld = path.transform.TransformPoint(s.positionLocal);
-                Vector3 tanWorld = path.transform.TransformDirection(s.tangentLocal).normalized;
-
-                Vector3 posLocal = transform.InverseTransformPoint(posWorld);
-                Vector3 fwdLocal = transform.InverseTransformDirection(tanWorld).normalized;
-                if (fwdLocal.sqrMagnitude < 1e-8f) fwdLocal = Vector3.forward;
-
-                // Build orientation frame
-                Vector3 rightLocal, upLocal;
-
-                if (orientationMode == OrientationMode.KeepLevel)
-                {
-                    // Up is world-up (converted to this local), then orthonormalize.
-                    upLocal = upLocalRef;
-                    rightLocal = Vector3.Cross(upLocal, fwdLocal);
-                    if (rightLocal.sqrMagnitude < 1e-8f)
-                    {
-                        // Forward is near parallel to up; choose a fallback axis.
-                        rightLocal = Vector3.Cross(Vector3.forward, fwdLocal);
-                        if (rightLocal.sqrMagnitude < 1e-8f)
-                            rightLocal = Vector3.right;
-                    }
-                    rightLocal.Normalize();
-                    upLocal = Vector3.Cross(fwdLocal, rightLocal).normalized;
-                }
-                else // FollowRoll
-                {
-                    // Start from keep-level-like frame for stability.
-                    upLocal = upLocalRef;
-                    rightLocal = Vector3.Cross(upLocal, fwdLocal);
-                    if (rightLocal.sqrMagnitude < 1e-8f)
-                    {
-                        rightLocal = Vector3.Cross(Vector3.forward, fwdLocal);
-                        if (rightLocal.sqrMagnitude < 1e-8f)
-                            rightLocal = Vector3.right;
-                    }
-                    rightLocal.Normalize();
-                    upLocal = Vector3.Cross(fwdLocal, rightLocal).normalized;
-
-                    // Apply roll (degrees) around forward axis (roll is sampled from control points).
-                    float rollDeg = EvaluateRollDegreesApprox(s.t);
-                    if (Mathf.Abs(rollDeg) > 0.0001f)
-                    {
-                        Quaternion q = Quaternion.AngleAxis(rollDeg, fwdLocal);
-                        rightLocal = (q * rightLocal).normalized;
-                        upLocal = (q * upLocal).normalized;
-                    }
-                }
-
-                // Per-ring multipliers (approx from control points at param t)
-                widthMul[i] = Mathf.Max(0.0001f, EvaluateWidthScaleApprox(s.t));
-                heightMul[i] = Mathf.Max(0.0001f, EvaluateHeightScaleApprox(s.t));
-
-                frames.Add(new SplineExtruder.FrameSample
-                {
-                    positionLocal = posLocal,
-                    forwardLocal = fwdLocal,
-                    rightLocal = rightLocal,
-                    upLocal = upLocal,
-                    distance = s.distance, // NOTE: s.distance is in path-local polyline units; assumes same scale. OK if path & generator are same scale.
-                    s01 = s.s01
-                });
-            }
-
-            // If path and generator transforms differ in scale, distance from path-local may be off.
-            // For typical usage (same object), this is correct. If needed later, recompute distance in this-local.
-
-            // 3) Build mesh
             bool closed = useProfileClosedFlag ? profile.closed : forceClosed;
 
             var settings = new SplineExtruder.BuildSettings
@@ -245,119 +156,158 @@ namespace SplineMeshTool
                 baseHeight = baseHeight,
                 widthOverPath = widthOverPath,
                 heightOverPath = heightOverPath,
-                widthMultipliersPerRing = widthMul,
-                heightMultipliersPerRing = heightMul,
+                widthMultipliersPerRing = frameRes.widthMul,
+                heightMultipliersPerRing = frameRes.heightMul,
                 uScale = uScale * profile.uScale,
                 vMetersToUV = vMetersToUV * profile.vScale,
                 closed = closed
             };
 
-            Mesh newMesh = null;
+            Mesh newMesh;
             try
             {
-                newMesh = SplineExtruder.BuildMesh(frames, settings, "SplineMesh_Preview");
+                newMesh = SplineExtruder.BuildMesh(frameRes.frames, settings, "SplineMesh_Preview");
             }
             catch
             {
-                // If something goes wrong, don't break editor spam; just abort.
                 return;
             }
 
             AssignPreviewMesh(newMesh);
 
-            // 4) Optional collider
-            if (generateCollider)
+            // ----- Collider mesh (optional)
+            if (!generateCollider)
             {
-                float colStep = colliderMetersPerRing > 0f ? colliderMetersPerRing : metersPerRing;
+                AssignPreviewColliderMesh(null);
+                return;
+            }
 
-                List<SplinePath.Sample> rawCol = path.SampleByDistance(colStep, subdivisionsPerSegment, maxRings);
-                if (rawCol != null && rawCol.Count >= 2)
-                {
-                    var framesCol = new List<SplineExtruder.FrameSample>(rawCol.Count);
-                    float[] widthMulCol = new float[rawCol.Count];
-                    float[] heightMulCol = new float[rawCol.Count];
+            float colStep = colliderMetersPerRing > 0f ? colliderMetersPerRing : metersPerRing;
+            var rawCol = path.SampleByDistance(colStep, subdivisionsPerSegment, maxRings);
+            if (rawCol == null || rawCol.Count < 2)
+            {
+                AssignPreviewColliderMesh(null);
+                return;
+            }
 
-                    for (int i = 0; i < rawCol.Count; i++)
-                    {
-                        var s = rawCol[i];
+            var frameResCol = SplineFrameBuilder.BuildFrames(
+                path,
+                transform,
+                rawCol,
+                (SplineFrameBuilder.OrientationMode)orientationMode,
+                keepLevelUseWorldUp,
+                EvaluateRollDegreesApprox,
+                EvaluateWidthScaleApprox,
+                EvaluateHeightScaleApprox
+            );
 
-                        Vector3 posWorld = path.transform.TransformPoint(s.positionLocal);
-                        Vector3 tanWorld = path.transform.TransformDirection(s.tangentLocal).normalized;
+            var colSettings = settings;
+            colSettings.widthMultipliersPerRing = frameResCol.widthMul;
+            colSettings.heightMultipliersPerRing = frameResCol.heightMul;
 
-                        Vector3 posLocal = transform.InverseTransformPoint(posWorld);
-                        Vector3 fwdLocal = transform.InverseTransformDirection(tanWorld).normalized;
-                        if (fwdLocal.sqrMagnitude < 1e-8f) fwdLocal = Vector3.forward;
+            Mesh colMesh;
+            try
+            {
+                colMesh = SplineExtruder.BuildMesh(frameResCol.frames, colSettings, "SplineMesh_ColliderPreview");
+            }
+            catch
+            {
+                colMesh = null;
+            }
 
-                        Vector3 rightLocal, upLocal;
+            AssignPreviewColliderMesh(colMesh);
+        }
 
-                        if (orientationMode == OrientationMode.KeepLevel)
-                        {
-                            upLocal = upLocalRef;
-                            rightLocal = Vector3.Cross(upLocal, fwdLocal);
-                            if (rightLocal.sqrMagnitude < 1e-8f)
-                                rightLocal = Vector3.right;
-                            rightLocal.Normalize();
-                            upLocal = Vector3.Cross(fwdLocal, rightLocal).normalized;
-                        }
-                        else
-                        {
-                            upLocal = upLocalRef;
-                            rightLocal = Vector3.Cross(upLocal, fwdLocal);
-                            if (rightLocal.sqrMagnitude < 1e-8f)
-                                rightLocal = Vector3.right;
-                            rightLocal.Normalize();
-                            upLocal = Vector3.Cross(fwdLocal, rightLocal).normalized;
+#if UNITY_EDITOR
+        [ContextMenu("Bake Mesh Asset")]
+        public void BakeMeshAsset()
+        {
+            if (_mf == null) _mf = GetComponent<MeshFilter>();
+            if (_mc == null) _mc = GetComponent<MeshCollider>();
+            if (path == null) path = GetComponent<SplinePath>();
+            if (path == null || profile == null) return;
 
-                            float rollDeg = EvaluateRollDegreesApprox(s.t);
-                            if (Mathf.Abs(rollDeg) > 0.0001f)
-                            {
-                                Quaternion q = Quaternion.AngleAxis(rollDeg, fwdLocal);
-                                rightLocal = (q * rightLocal).normalized;
-                                upLocal = (q * upLocal).normalized;
-                            }
-                        }
+            bool wasBaked = isBaked;
+            isBaked = false;
+            RebuildPreview();
+            isBaked = wasBaked;
 
-                        widthMulCol[i] = Mathf.Max(0.0001f, EvaluateWidthScaleApprox(s.t));
-                        heightMulCol[i] = Mathf.Max(0.0001f, EvaluateHeightScaleApprox(s.t));
+            if (_mf.sharedMesh == null) return;
 
-                        framesCol.Add(new SplineExtruder.FrameSample
-                        {
-                            positionLocal = posLocal,
-                            forwardLocal = fwdLocal,
-                            rightLocal = rightLocal,
-                            upLocal = upLocal,
-                            distance = s.distance,
-                            s01 = s.s01
-                        });
-                    }
+            EnsureFolderExists(bakedFolder);
 
-                    var colSettings = settings;
-                    colSettings.widthMultipliersPerRing = widthMulCol;
-                    colSettings.heightMultipliersPerRing = heightMulCol;
+            string baseName = $"{gameObject.name}_{profile.name}";
+            string meshPath = AssetDatabase.GenerateUniqueAssetPath($"{bakedFolder}/{baseName}.mesh");
 
-                    Mesh colMesh = null;
-                    try
-                    {
-                        colMesh = SplineExtruder.BuildMesh(framesCol, colSettings, "SplineMesh_ColliderPreview");
-                    }
-                    catch
-                    {
-                        colMesh = null;
-                    }
+            Mesh baked = Object.Instantiate(_mf.sharedMesh);
+            baked.name = System.IO.Path.GetFileNameWithoutExtension(meshPath);
+            AssetDatabase.CreateAsset(baked, meshPath);
 
-                    AssignPreviewColliderMesh(colMesh);
-                }
+            bakedMeshAsset = baked;
+            isBaked = true;
+
+            _mf.sharedMesh = bakedMeshAsset;
+
+            if (generateCollider && _mc != null && _mc.sharedMesh != null)
+            {
+                string colPath = AssetDatabase.GenerateUniqueAssetPath($"{bakedFolder}/{baseName}_Collider.mesh");
+                Mesh bakedCol = Object.Instantiate(_mc.sharedMesh);
+                bakedCol.name = System.IO.Path.GetFileNameWithoutExtension(colPath);
+                AssetDatabase.CreateAsset(bakedCol, colPath);
+
+                bakedColliderMeshAsset = bakedCol;
+                _mc.sharedMesh = null;
+                _mc.sharedMesh = bakedColliderMeshAsset;
             }
             else
             {
-                AssignPreviewColliderMesh(null);
+                bakedColliderMeshAsset = null;
+                if (_mc != null) _mc.sharedMesh = null;
             }
+
+            CleanupPreviewMeshes();
+
+            EditorUtility.SetDirty(this);
+            AssetDatabase.SaveAssets();
         }
 
-        // -----------------------------
-        // Approximations from control points (roll/width/height)
-        // -----------------------------
+        [ContextMenu("Clear Bake")]
+        public void ClearBake()
+        {
+            if (_mf == null) _mf = GetComponent<MeshFilter>();
+            if (_mc == null) _mc = GetComponent<MeshCollider>();
 
+            isBaked = false;
+            bakedMeshAsset = null;
+            bakedColliderMeshAsset = null;
+
+            if (autoRebuild)
+                RebuildPreview();
+            else
+                _mf.sharedMesh = null;
+
+            if (_mc != null) _mc.sharedMesh = null;
+
+            EditorUtility.SetDirty(this);
+        }
+
+        private static void EnsureFolderExists(string folder)
+        {
+            if (AssetDatabase.IsValidFolder(folder)) return;
+
+            string[] parts = folder.Split('/');
+            string current = parts[0]; // Assets
+            for (int i = 1; i < parts.Length; i++)
+            {
+                string next = $"{current}/{parts[i]}";
+                if (!AssetDatabase.IsValidFolder(next))
+                    AssetDatabase.CreateFolder(current, parts[i]);
+                current = next;
+            }
+        }
+#endif
+
+        // ---- Control-point scalar eval (same as before)
         private float EvaluateRollDegreesApprox(float t01)
         {
             if (path == null || path.points == null || path.points.Count == 0) return 0f;
@@ -395,15 +345,10 @@ namespace SplineMeshTool
             return Mathf.Lerp(v0, v1, a);
         }
 
-        // -----------------------------
-        // Mesh assignment + cleanup
-        // -----------------------------
-
         private void AssignPreviewMesh(Mesh newMesh)
         {
             if (_mf == null) _mf = GetComponent<MeshFilter>();
 
-            // Destroy previous preview mesh if it was ours.
             if (_previewMesh != null)
             {
 #if UNITY_EDITOR
@@ -418,10 +363,7 @@ namespace SplineMeshTool
             _previewMesh = newMesh;
 
 #if UNITY_EDITOR
-            if (!Application.isPlaying)
-                _mf.sharedMesh = _previewMesh;
-            else
-                _mf.mesh = _previewMesh;
+            _mf.sharedMesh = _previewMesh;
 #else
             _mf.mesh = _previewMesh;
 #endif
@@ -432,7 +374,6 @@ namespace SplineMeshTool
             if (_mc == null) _mc = GetComponent<MeshCollider>();
             if (_mc == null) return;
 
-            // Destroy previous collider preview mesh if it was ours.
             if (_previewColliderMesh != null)
             {
 #if UNITY_EDITOR

@@ -13,10 +13,10 @@ MonoBehaviour:
   m_Name: Profile_Canyon_Wall
   m_EditorClassIdentifier: 
   points:
-  - {x: -6, y: 0}
-  - {x: 6, y: 0}
-  - {x: 6, y: 6}
-  - {x: -6, y: 6}
+  - {x: -5, y: 5}
+  - {x: -5, y: 0}
+  - {x: 5, y: 0}
+  - {x: 5, y: 5}
   closed: 0
   uScale: 1
   vScale: 1

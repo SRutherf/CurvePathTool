@@ -3,10 +3,6 @@ using UnityEngine;
 
 namespace SplineMeshTool
 {
-    /// <summary>
-    /// Stores control points and provides Catmull-Rom evaluation + distance-based sampling.
-    /// t is normalized [0..1] over the whole path (from first point to last point).
-    /// </summary>
     [ExecuteAlways]
     public class SplinePath : MonoBehaviour
     {
@@ -15,6 +11,16 @@ namespace SplineMeshTool
 
         [Tooltip("Control points in local space of this transform.")]
         public List<SplinePoint> points = new List<SplinePoint>();
+
+        public enum InterpMode
+        {
+            Linear,
+            CatmullRomUniform,
+            CatmullRomCentripetal // recommended
+        }
+
+        [Header("Interpolation")]
+        public InterpMode interpMode = InterpMode.CatmullRomCentripetal;
 
         [Header("Preview")]
         [Min(1)] public int previewSubdivisionsPerSegment = 16;
@@ -41,7 +47,6 @@ namespace SplineMeshTool
                 points.Add(new SplinePoint(pos));
             }
 
-            // Ensure sane defaults
             for (int i = 0; i < points.Count; i++)
             {
                 var p = points[i];
@@ -55,45 +60,40 @@ namespace SplineMeshTool
         // Public API
         // -----------------------------
 
-        /// <summary>
-        /// Evaluate local-space position at normalized t [0..1] using Catmull-Rom (clamped endpoints).
-        /// </summary>
         public Vector3 EvaluateLocalPosition(float t)
         {
             if (PointCount == 0) return Vector3.zero;
             if (PointCount == 1) return points[0].position;
-            if (PointCount == 2) return Vector3.Lerp(points[0].position, points[1].position, Mathf.Clamp01(t));
 
             t = Mathf.Clamp01(t);
+
+            if (interpMode == InterpMode.Linear || PointCount == 2)
+                return EvaluateLinearPos(t);
 
             // Map t across segments [0..SegmentCount)
             float scaled = t * SegmentCount;
             int seg = Mathf.Min(Mathf.FloorToInt(scaled), SegmentCount - 1);
             float u = scaled - seg;
 
-            // Catmull-Rom uses p0,p1,p2,p3 with p1->p2 as the segment
             Vector3 p0 = GetPointClamped(seg - 1).position;
             Vector3 p1 = GetPointClamped(seg).position;
             Vector3 p2 = GetPointClamped(seg + 1).position;
             Vector3 p3 = GetPointClamped(seg + 2).position;
 
-            return CatmullRom(p0, p1, p2, p3, u);
+            if (interpMode == InterpMode.CatmullRomCentripetal)
+                return CatmullRomCentripetal(p0, p1, p2, p3, u);
+            else
+                return CatmullRomUniform(p0, p1, p2, p3, u);
         }
 
-        /// <summary>
-        /// Evaluate local-space tangent (unit) at normalized t [0..1].
-        /// </summary>
         public Vector3 EvaluateLocalTangent(float t)
         {
             if (PointCount < 2) return Vector3.forward;
 
-            if (PointCount == 2)
-            {
-                Vector3 dir = (points[1].position - points[0].position);
-                return dir.sqrMagnitude > 1e-8f ? dir.normalized : Vector3.forward;
-            }
-
             t = Mathf.Clamp01(t);
+
+            if (interpMode == InterpMode.Linear || PointCount == 2)
+                return EvaluateLinearTan(t);
 
             float scaled = t * SegmentCount;
             int seg = Mathf.Min(Mathf.FloorToInt(scaled), SegmentCount - 1);
@@ -104,12 +104,43 @@ namespace SplineMeshTool
             Vector3 p2 = GetPointClamped(seg + 1).position;
             Vector3 p3 = GetPointClamped(seg + 2).position;
 
-            Vector3 d = CatmullRomDerivative(p0, p1, p2, p3, u);
+            Vector3 d = (interpMode == InterpMode.CatmullRomCentripetal)
+                ? CatmullRomCentripetalDerivative(p0, p1, p2, p3, u)
+                : CatmullRomUniformDerivative(p0, p1, p2, p3, u);
+
             return d.sqrMagnitude > 1e-8f ? d.normalized : Vector3.forward;
         }
 
         public Vector3 EvaluateWorldPosition(float t) => transform.TransformPoint(EvaluateLocalPosition(t));
         public Vector3 EvaluateWorldTangent(float t) => transform.TransformDirection(EvaluateLocalTangent(t)).normalized;
+
+        private Vector3 EvaluateLinearPos(float t)
+        {
+            if (PointCount == 2) return Vector3.Lerp(points[0].position, points[1].position, t);
+
+            float scaled = t * SegmentCount;
+            int seg = Mathf.Min(Mathf.FloorToInt(scaled), SegmentCount - 1);
+            float u = scaled - seg;
+
+            Vector3 a = points[seg].position;
+            Vector3 b = points[seg + 1].position;
+            return Vector3.Lerp(a, b, u);
+        }
+
+        private Vector3 EvaluateLinearTan(float t)
+        {
+            if (PointCount == 2)
+            {
+                Vector3 dir = (points[1].position - points[0].position);
+                return dir.sqrMagnitude > 1e-8f ? dir.normalized : Vector3.forward;
+            }
+
+            float scaled = t * SegmentCount;
+            int seg = Mathf.Min(Mathf.FloorToInt(scaled), SegmentCount - 1);
+
+            Vector3 dir2 = points[seg + 1].position - points[seg].position;
+            return dir2.sqrMagnitude > 1e-8f ? dir2.normalized : Vector3.forward;
+        }
 
         public struct Sample
         {
@@ -120,10 +151,6 @@ namespace SplineMeshTool
             public float t;                // normalized param [0..1] (approx)
         }
 
-        /// <summary>
-        /// Returns samples approximately every stepMeters along the path (local units), including start and end.
-        /// Uses a polyline approximation then resamples by distance for stability.
-        /// </summary>
         public List<Sample> SampleByDistance(float stepMeters, int subdivisionsPerSegment = 16, int maxSamples = 20000)
         {
             stepMeters = Mathf.Max(0.01f, stepMeters);
@@ -135,7 +162,6 @@ namespace SplineMeshTool
             if (poly.Count < 2)
                 return outSamples;
 
-            // Compute cumulative distances
             float[] cum = new float[poly.Count];
             cum[0] = 0f;
             for (int i = 1; i < poly.Count; i++)
@@ -155,17 +181,14 @@ namespace SplineMeshTool
                 return outSamples;
             }
 
-            // Always include start
             outSamples.Add(MakeSampleAtDistance(0f));
 
-            // Place samples each stepMeters
             for (float d = stepMeters; d < totalLen; d += stepMeters)
             {
                 if (outSamples.Count >= maxSamples) break;
                 outSamples.Add(MakeSampleAtDistance(d));
             }
 
-            // Always include end
             if (outSamples.Count < maxSamples)
                 outSamples.Add(MakeSampleAtDistance(totalLen));
 
@@ -173,7 +196,6 @@ namespace SplineMeshTool
 
             Sample MakeSampleAtDistance(float targetD)
             {
-                // Find segment in polyline
                 int idx = System.Array.BinarySearch(cum, targetD);
                 if (idx < 0) idx = ~idx;
                 idx = Mathf.Clamp(idx, 1, poly.Count - 1);
@@ -183,13 +205,10 @@ namespace SplineMeshTool
                 float a = Mathf.InverseLerp(d0, d1, targetD);
 
                 Vector3 p = Vector3.Lerp(poly[idx - 1], poly[idx], a);
-
                 Vector3 dir = (poly[idx] - poly[idx - 1]);
                 Vector3 tan = dir.sqrMagnitude > 1e-8f ? dir.normalized : Vector3.forward;
 
                 float s01 = targetD / totalLen;
-
-                // Approximate t from polyline index
                 float tApprox = (idx - 1 + a) / (poly.Count - 1);
 
                 return new Sample
@@ -225,13 +244,9 @@ namespace SplineMeshTool
                 return poly;
             }
 
-            int segs = SegmentCount;
-
-            // Include first point
             poly.Add(EvaluateLocalPosition(0f));
 
-            // Add interior samples
-            int totalSteps = segs * subdivisionsPerSegment;
+            int totalSteps = SegmentCount * subdivisionsPerSegment;
             for (int i = 1; i <= totalSteps; i++)
             {
                 float t = (float)i / totalSteps;
@@ -241,10 +256,9 @@ namespace SplineMeshTool
             return poly;
         }
 
-        // Catmull-Rom (uniform) position
-        public static Vector3 CatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
+        // -------- Uniform Catmull-Rom (original) --------
+        public static Vector3 CatmullRomUniform(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
         {
-            // 0.5 * ((2 p1) + (-p0 + p2) t + (2p0 - 5p1 + 4p2 - p3) t^2 + (-p0 + 3p1 - 3p2 + p3) t^3)
             float t2 = t * t;
             float t3 = t2 * t;
 
@@ -256,10 +270,8 @@ namespace SplineMeshTool
             );
         }
 
-        // Derivative of Catmull-Rom
-        public static Vector3 CatmullRomDerivative(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
+        public static Vector3 CatmullRomUniformDerivative(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
         {
-            // 0.5 * ((-p0 + p2) + 2(2p0 -5p1 +4p2 -p3)t + 3(-p0 +3p1 -3p2 +p3)t^2)
             float t2 = t * t;
 
             return 0.5f * (
@@ -269,6 +281,48 @@ namespace SplineMeshTool
             );
         }
 
+        // -------- Centripetal Catmull-Rom (alpha = 0.5) --------
+        // Uses chord-length parameterization to reduce overshoot.
+        public static Vector3 CatmullRomCentripetal(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
+        {
+            // Parameterize points
+            float t0 = 0f;
+            float t1 = t0 + Mathf.Sqrt(Vector3.Distance(p0, p1));
+            float t2 = t1 + Mathf.Sqrt(Vector3.Distance(p1, p2));
+            float t3 = t2 + Mathf.Sqrt(Vector3.Distance(p2, p3));
+
+            // Map u in [0..1] to actual time between t1..t2
+            float tt = Mathf.Lerp(t1, t2, t);
+
+            Vector3 A1 = LerpSafe(p0, p1, (tt - t0) / (t1 - t0));
+            Vector3 A2 = LerpSafe(p1, p2, (tt - t1) / (t2 - t1));
+            Vector3 A3 = LerpSafe(p2, p3, (tt - t2) / (t3 - t2));
+
+            Vector3 B1 = LerpSafe(A1, A2, (tt - t0) / (t2 - t0));
+            Vector3 B2 = LerpSafe(A2, A3, (tt - t1) / (t3 - t1));
+
+            Vector3 C  = LerpSafe(B1, B2, (tt - t1) / (t2 - t1));
+            return C;
+        }
+
+        public static Vector3 CatmullRomCentripetalDerivative(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t)
+        {
+            // Numerical derivative (stable enough for tangent) to avoid messy analytic form here.
+            const float eps = 0.001f;
+            float tA = Mathf.Clamp01(t - eps);
+            float tB = Mathf.Clamp01(t + eps);
+            Vector3 a = CatmullRomCentripetal(p0, p1, p2, p3, tA);
+            Vector3 b = CatmullRomCentripetal(p0, p1, p2, p3, tB);
+            Vector3 d = (b - a) / Mathf.Max(1e-6f, (tB - tA));
+            return d;
+        }
+
+        private static Vector3 LerpSafe(Vector3 a, Vector3 b, float t)
+        {
+            if (float.IsNaN(t) || float.IsInfinity(t)) return b;
+            return Vector3.Lerp(a, b, Mathf.Clamp01(t));
+        }
+
         private void OnDrawGizmosSelected()
         {
             if (!drawGizmos) return;
@@ -276,12 +330,10 @@ namespace SplineMeshTool
 
             Gizmos.matrix = transform.localToWorldMatrix;
 
-            // Control points
             Gizmos.color = Color.yellow;
             for (int i = 0; i < PointCount; i++)
                 Gizmos.DrawSphere(points[i].position, 0.25f);
 
-            // Curve preview
             Gizmos.color = Color.cyan;
             var poly = BuildPolyline(previewSubdivisionsPerSegment);
             for (int i = 1; i < poly.Count; i++)
