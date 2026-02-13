@@ -48,6 +48,19 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c0f32e66e98deb24a8886391e32de279, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  minPoints: 2
+  points:
+  - position: {x: 0, y: 0, z: 0}
+    rollDegrees: 0
+    widthScale: 1
+    heightScale: 1
+  - position: {x: 0, y: 0, z: 10}
+    rollDegrees: 0
+    widthScale: 1
+    heightScale: 1
+  interpMode: 2
+  previewSubdivisionsPerSegment: 16
+  drawGizmos: 1
 --- !u!114 &8430691702338011982
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -60,6 +73,76 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 949b09f01253f4b4c80a7506a005523d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  path: {fileID: 5799552241975221377}
+  profile: {fileID: 11400000, guid: d706b264dd63fd2469cf73bef4314702, type: 2}
+  useProfileClosedFlag: 1
+  forceClosed: 0
+  metersPerRing: 1.5
+  subdivisionsPerSegment: 16
+  maxRings: 20000
+  orientationMode: 1
+  keepLevelUseWorldUp: 1
+  baseWidth: 1
+  baseHeight: 1
+  widthOverPath:
+    serializedVersion: 2
+    m_Curve:
+    - serializedVersion: 3
+      time: 0
+      value: 1
+      inSlope: 0
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    - serializedVersion: 3
+      time: 1
+      value: 1
+      inSlope: 0
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    m_PreInfinity: 2
+    m_PostInfinity: 2
+    m_RotationOrder: 4
+  heightOverPath:
+    serializedVersion: 2
+    m_Curve:
+    - serializedVersion: 3
+      time: 0
+      value: 1
+      inSlope: 0
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    - serializedVersion: 3
+      time: 1
+      value: 1
+      inSlope: 0
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    m_PreInfinity: 2
+    m_PostInfinity: 2
+    m_RotationOrder: 4
+  uScale: 1
+  vMetersToUV: 0.25
+  generateCollider: 0
+  colliderMetersPerRing: -1
+  autoRebuild: 1
+  rebuildInEditMode: 1
+  freezeWhenBaked: 1
+  bakedFolder: Assets/SplineMeshTool/BakedMeshes
+  bakedMeshAsset: {fileID: 0}
+  bakedColliderMeshAsset: {fileID: 0}
+  isBaked: 0
 --- !u!33 &3552760935301547843
 MeshFilter:
   m_ObjectHideFlags: 0
